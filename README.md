@@ -98,9 +98,9 @@ Server (Next.js API Routes)
 ## Configuration
 
 - `OPENAI_API_KEY` (server): Required. A standard server key with access to Realtime
-- `NEXT_PUBLIC_REALTIME_TRANSPORT` (client):
-  - Omit for WebRTC (recommended in browsers)
-  - Set to `websocket` to use WS (manual mic/output)
+- Transport (client): Select in the UI before starting
+  - WebRTC (default, recommended for browsers): native mic/speaker, lowest latency
+  - WebSocket: manual mic streaming + audio playback (included in this repo)
 - `NEXT_PUBLIC_DEBUG_REALTIME` (client):
   - Set to `1` to log all raw transport events (`session.created`, `response.*`, etc.)
 

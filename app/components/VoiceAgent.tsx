@@ -52,6 +52,17 @@ export default function VoiceAgent() {
   const activityLoggedUserIdsRef = useRef<Set<string>>(new Set());
   const activityLoggedAssistantIdsRef = useRef<Set<string>>(new Set());
   const [traceOpen, setTraceOpen] = useState<boolean>(false);
+  // Transport selection (UI-controlled). Default to WebRTC; persist to localStorage for convenience.
+  const [transport, setTransport] = useState<'webrtc' | 'websocket'>(() => {
+    try {
+      const v = typeof window !== 'undefined' ? window.localStorage.getItem('realtime-transport') : null;
+      if (v === 'websocket' || v === 'webrtc') return v;
+    } catch {}
+    return 'webrtc';
+  });
+  useEffect(() => {
+    try { window.localStorage.setItem('realtime-transport', transport); } catch {}
+  }, [transport]);
 
   function addToast(text: string, kind: 'info'|'error'|'success' = 'info', ttl = 2500) {
     const id = toastIdRef.current++;
@@ -280,21 +291,17 @@ export default function VoiceAgent() {
       // Create session with model configuration aligned with server-minted session
       const model = "gpt-realtime" as const;
       // Use a server-relayed WebRTC handshake to avoid browser-to-OpenAI SDP/CORS issues
-      const transportEnv = process.env.NEXT_PUBLIC_REALTIME_TRANSPORT;
       const relayUrl = `${window.location.origin}/api/realtime/handshake`;
       const session = new RealtimeSession(agent, {
         model,
-        transport:
-          transportEnv === "websocket"
-            ? "websocket"
-            : new OpenAIRealtimeWebRTC({ baseUrl: relayUrl }),
+        transport: transport === 'websocket' ? 'websocket' : new OpenAIRealtimeWebRTC({ baseUrl: relayUrl }),
       });
 
       // Set up event listeners
       session.on("audio", (audioEvent: any) => {
         try {
           console.log("[VoiceAgent] audio event", audioEvent?.type || typeof audioEvent, audioEvent);
-          if (transportEnv === "websocket") {
+          if (transport === "websocket") {
             const buf: ArrayBuffer | undefined = audioEvent?.data;
             if (buf && buf.byteLength > 0) {
               enqueuePcm16Playback(new Int16Array(buf), 24000);
@@ -457,7 +464,7 @@ export default function VoiceAgent() {
         }
         listeningTimeoutRef.current = window.setTimeout(() => setListening(false), 600);
         // In WS mode, we control playback locally — stop any queued audio immediately
-        if (transportEnv === "websocket") {
+        if (transport === "websocket") {
           stopAllQueuedAudioPlayback();
         }
         addToast("Interrupted", "info", 1200);
@@ -597,7 +604,7 @@ export default function VoiceAgent() {
       // Setup audio processing for microphone input
       // - WebRTC: automatic (handled by SDK)
       // - WebSocket: we must stream mic audio manually
-      if (transportEnv === "websocket") {
+      if (transport === "websocket") {
         try {
           await startWebSocketMicStreaming(session);
         } catch (e) {
@@ -606,7 +613,7 @@ export default function VoiceAgent() {
       }
       
       setStatus("connecting");
-      console.log("[VoiceAgent] Connecting to realtime... transport=", transportEnv === "websocket" ? "websocket" : "webrtc", "relay=", relayUrl);
+      console.log("[VoiceAgent] Connecting to realtime... transport=", transport, "relay=", relayUrl);
 
       // Connect to OpenAI Realtime
       // This automatically configures audio input/output in the browser via WebRTC
@@ -734,6 +741,20 @@ export default function VoiceAgent() {
                   <span className={`inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-medium ${chip.bg} ${chip.text} ${chip.ring}`}>
                     <span className="w-2 h-2 rounded-full" style={{ background: chip.dot }} />
                     {chip.label}
+                  </span>
+                );
+              })()}
+              {/* Transport chip */}
+              {(() => {
+                const isWS = transport === 'websocket';
+                const bg = isWS ? 'bg-blue-100' : 'bg-green-100';
+                const text = isWS ? 'text-blue-700' : 'text-green-700';
+                const ring = isWS ? 'ring-1 ring-blue-200' : 'ring-1 ring-green-200';
+                const dot = isWS ? '#2563eb' : '#16a34a';
+                return (
+                  <span className={`inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-medium ${bg} ${text} ${ring}`} title="Current transport">
+                    <span className="w-2 h-2 rounded-full" style={{ background: dot }} />
+                    Transport: {isWS ? 'WebSocket' : 'WebRTC'}
                   </span>
                 );
               })()}
@@ -919,6 +940,32 @@ export default function VoiceAgent() {
 
         {/* Side panel */}
         <aside className="bg-white rounded-lg shadow-lg p-4 md:sticky md:top-6 h-fit">
+          <h3 className="font-semibold text-gray-800 mb-2">Transport</h3>
+          <div className="flex flex-col gap-2 mb-4">
+            <div className="flex items-center gap-4">
+              <label className="flex items-center gap-1 text-gray-700">
+                <input
+                  type="radio"
+                  name="transport"
+                  checked={transport === 'webrtc'}
+                  onChange={() => setTransport('webrtc')}
+                  disabled={status !== 'idle'}
+                />
+                WebRTC (recommended)
+              </label>
+              <label className="flex items-center gap-1 text-gray-700">
+                <input
+                  type="radio"
+                  name="transport"
+                  checked={transport === 'websocket'}
+                  onChange={() => setTransport('websocket')}
+                  disabled={status !== 'idle'}
+                />
+                WebSocket
+              </label>
+            </div>
+            <p className="text-xs text-gray-500">WebRTC auto‑handles mic/output with the lowest latency. WebSocket uses manual mic streaming and playback (available for comparisons).</p>
+          </div>
           <h3 className="font-semibold text-gray-800 mb-3">Turn Detection & Interrupt</h3>
           <div className="flex flex-col gap-3">
             <div className="flex flex-col gap-2">
