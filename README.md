@@ -251,6 +251,10 @@ Developer Trace Drawer
 - Lint: `npm run lint`
 - Build: `npm run build`
 
+## TODO
+
+- Orb animation polish: The listening/speaking orb occasionally fails to animate or gets stuck after state changes. Track and fix visual state transitions (listening ↔ speaking ↔ idle) across both WebRTC and WebSocket, ensuring consistent event mapping and no flicker. Consider adding an optional local audio level meter for WebRTC to drive visuals when server events lag.
+
 ## License
 
-MIT
+MIT. You may use, copy, modify, and distribute this project commercially or privately. Attribution is required by keeping the copyright and permission notice from `LICENSE` in your distributions.

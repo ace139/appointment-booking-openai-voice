@@ -52,6 +52,11 @@ export default function VoiceAgent() {
   const activityLoggedUserIdsRef = useRef<Set<string>>(new Set());
   const activityLoggedAssistantIdsRef = useRef<Set<string>>(new Set());
   const [traceOpen, setTraceOpen] = useState<boolean>(false);
+  // Mirror reactive state in refs for fast checks inside audio handlers
+  const listeningRef = useRef<boolean>(false);
+  const speakingRef = useRef<boolean>(false);
+  useEffect(() => { listeningRef.current = listening; }, [listening]);
+  useEffect(() => { speakingRef.current = speaking; }, [speaking]);
   // Transport selection (UI-controlled). Default to WebRTC; persist to localStorage for convenience.
   const [transport, setTransport] = useState<'webrtc' | 'websocket'>(() => {
     try {
@@ -183,6 +188,27 @@ export default function VoiceAgent() {
       const buf: ArrayBuffer | undefined = ev.data?.buffer;
       if (!buf) return;
       const float = new Float32Array(buf);
+      // Lightweight peak detector for listening animation in WS mode
+      try {
+        if (!speakingRef.current) {
+          let peak = 0;
+          const stride = Math.max(1, Math.floor(float.length / 256));
+          for (let i = 0; i < float.length; i += stride) {
+            const v = Math.abs(float[i]);
+            if (v > peak) peak = v;
+          }
+          const isActive = peak > 0.02; // empirical threshold
+          if (isActive) {
+            if (!listeningRef.current) setListening(true);
+            if (listeningTimeoutRef.current) {
+              window.clearTimeout(listeningTimeoutRef.current);
+              listeningTimeoutRef.current = null;
+            }
+          } else if (listeningRef.current && !listeningTimeoutRef.current) {
+            listeningTimeoutRef.current = window.setTimeout(() => setListening(false), 180);
+          }
+        }
+      } catch {}
       const pcm16 = resampleToPcm16(float, ctx.sampleRate, 24000);
       try {
         (session as any).sendAudio(pcm16.buffer, { commit: false });
@@ -431,6 +457,8 @@ export default function VoiceAgent() {
       (session as any).on?.("audio_start", () => {
         console.log("[VoiceAgent] audio_start");
         setSpeaking(true);
+        // Ensure we are not simultaneously in 'listening' visual state
+        setListening(false);
         setThinking(false);
         // First audio latency from turn start
         if (lastTurnStartRef.current) {
@@ -457,12 +485,12 @@ export default function VoiceAgent() {
       });
       (session as any).on?.("audio_interrupted", () => {
         console.log("[VoiceAgent] audio_interrupted");
-        // Show a brief listening cue
+        // Begin listening state and keep it until speech_stopped to avoid flicker
         setListening(true);
         if (listeningTimeoutRef.current) {
           window.clearTimeout(listeningTimeoutRef.current);
+          listeningTimeoutRef.current = null;
         }
-        listeningTimeoutRef.current = window.setTimeout(() => setListening(false), 600);
         // In WS mode, we control playback locally — stop any queued audio immediately
         if (transport === "websocket") {
           stopAllQueuedAudioPlayback();
@@ -519,10 +547,13 @@ export default function VoiceAgent() {
 
       // Also reflect listening on server VAD speech start/stop
       (session as any).on?.("input_audio_buffer.speech_started", () => {
+        // Enter listening state and hold until speech_stopped
         setListening(true);
         lastSpeechStartAtRef.current = Date.now();
-        if (listeningTimeoutRef.current) window.clearTimeout(listeningTimeoutRef.current);
-        listeningTimeoutRef.current = window.setTimeout(() => setListening(false), 600);
+        if (listeningTimeoutRef.current) {
+          window.clearTimeout(listeningTimeoutRef.current);
+          listeningTimeoutRef.current = null;
+        }
       });
       (session as any).on?.("input_audio_buffer.speech_stopped", () => {
         if (listeningTimeoutRef.current) {
@@ -939,84 +970,123 @@ export default function VoiceAgent() {
         )}
 
         {/* Side panel */}
-        <aside className="bg-white rounded-lg shadow-lg p-4 md:sticky md:top-6 h-fit">
-          <h3 className="font-semibold text-gray-800 mb-2">Transport</h3>
-          <div className="flex flex-col gap-2 mb-4">
-            <div className="flex items-center gap-4">
-              <label className="flex items-center gap-1 text-gray-700">
-                <input
-                  type="radio"
-                  name="transport"
-                  checked={transport === 'webrtc'}
-                  onChange={() => setTransport('webrtc')}
-                  disabled={status !== 'idle'}
-                />
-                WebRTC (recommended)
-              </label>
-              <label className="flex items-center gap-1 text-gray-700">
-                <input
-                  type="radio"
-                  name="transport"
-                  checked={transport === 'websocket'}
-                  onChange={() => setTransport('websocket')}
-                  disabled={status !== 'idle'}
-                />
-                WebSocket
-              </label>
-            </div>
-            <p className="text-xs text-gray-500">WebRTC auto‑handles mic/output with the lowest latency. WebSocket uses manual mic streaming and playback (available for comparisons).</p>
-          </div>
-          <h3 className="font-semibold text-gray-800 mb-3">Turn Detection & Interrupt</h3>
-          <div className="flex flex-col gap-3">
-            <div className="flex flex-col gap-2">
-              <span className="text-gray-700 flex items-center gap-2">VAD Mode
-                <span className="tooltip">
-                  <span className="w-4 h-4 inline-flex items-center justify-center rounded-full bg-gray-200 text-gray-700 text-[10px]">i</span>
-                  <span className="tooltip-panel">Choose how turns end. Semantic VAD uses a turn model for natural pauses. Server VAD uses volume + silence for snappy turn ends.</span>
-                </span>
-              </span>
-              <div className="flex items-center gap-4">
-                <label className="flex items-center gap-1 text-gray-700">
+        <aside className="bg-white rounded-xl shadow-lg p-5 md:p-6 md:sticky md:top-6 h-fit">
+          <div className="space-y-5">
+            {/* Transport Section */}
+            <section className="rounded-lg border border-gray-200/60 bg-gray-50/70 p-4">
+              <div className="flex items-start justify-between">
+                <h3 className="font-semibold text-gray-800 flex items-center gap-2">
+                  Transport
+                  <span className="tooltip">
+                    <span className="w-4 h-4 inline-flex items-center justify-center rounded-full bg-gray-200 text-gray-700 text-[10px]">i</span>
+                    <span className="tooltip-panel">WebRTC: lowest latency, browser-native mic/speaker. WebSocket: manual mic streaming and playback; use when RTC is blocked or for server/telephony.</span>
+                  </span>
+                </h3>
+              </div>
+              <div className="mt-3 space-y-3">
+                <label className="flex items-start gap-3 text-gray-800">
                   <input
                     type="radio"
-                    name="vad-mode"
-                    checked={vadMode === "semantic_vad"}
-                    onChange={() => setVadMode("semantic_vad")}
-                    disabled={status !== "idle"}
+                    name="transport"
+                    className="mt-1"
+                    checked={transport === 'webrtc'}
+                    onChange={() => setTransport('webrtc')}
+                    disabled={status !== 'idle'}
                   />
-                  Semantic VAD
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2"><span>WebRTC <span className="text-gray-500">(recommended)</span></span>
+                      <span className="tooltip">
+                        <span className="w-4 h-4 inline-flex items-center justify-center rounded-full bg-gray-200 text-gray-700 text-[10px]">i</span>
+                        <span className="tooltip-panel">Auto mic/output, echo control, jitter buffering; best UX and latency in browsers.</span>
+                      </span>
+                    </div>
+                    <p className="text-xs text-gray-500 mt-0.5">Native mic and speaker with minimal setup and the lowest latency.</p>
+                  </div>
                 </label>
-                <label className="flex items-center gap-1 text-gray-700">
+                <label className="flex items-start gap-3 text-gray-800">
                   <input
                     type="radio"
-                    name="vad-mode"
-                    checked={vadMode === "server_vad"}
-                    onChange={() => setVadMode("server_vad")}
-                    disabled={status !== "idle"}
+                    name="transport"
+                    className="mt-1"
+                    checked={transport === 'websocket'}
+                    onChange={() => setTransport('websocket')}
+                    disabled={status !== 'idle'}
                   />
-                  Server VAD
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2"><span>WebSocket</span>
+                      <span className="tooltip">
+                        <span className="w-4 h-4 inline-flex items-center justify-center rounded-full bg-gray-200 text-gray-700 text-[10px]">i</span>
+                        <span className="tooltip-panel">Manual mic streaming + PCM playback; slightly higher latency; good for restricted networks or server/telephony.</span>
+                      </span>
+                    </div>
+                    <p className="text-xs text-gray-500 mt-0.5">Manual mic streaming and browser playback. Useful when RTC is blocked.</p>
+                  </div>
                 </label>
               </div>
-            </div>
+            </section>
 
-            <label className="flex items-center gap-2 text-gray-700">
-              <input
-                type="checkbox"
-                checked={interruptResponse}
-                onChange={(e) => setInterruptResponse(e.target.checked)}
-                disabled={status !== "idle"}
-              />
-              Auto-interrupt
-              <span className="tooltip">
-                <span className="w-4 h-4 inline-flex items-center justify-center rounded-full bg-gray-200 text-gray-700 text-[10px]">i</span>
-                <span className="tooltip-panel">When enabled, the assistant audio is cut as soon as your speech starts, reducing talk-over during barge-in.</span>
-              </span>
-            </label>
+            {/* Turn Detection & Interrupt Section */}
+            <section className="rounded-lg border border-gray-200/60 bg-gray-50/70 p-4">
+              <h3 className="font-semibold text-gray-800 mb-3">Turn Detection &amp; Interrupt</h3>
+              <div className="flex flex-col gap-4">
+                <div className="flex flex-col gap-2">
+                  <span className="text-gray-700 flex items-center gap-2">VAD Mode
+                    <span className="tooltip">
+                      <span className="w-4 h-4 inline-flex items-center justify-center rounded-full bg-gray-200 text-gray-700 text-[10px]">i</span>
+                      <span className="tooltip-panel">Choose how turns end. Semantic VAD uses a turn model for natural pauses. Server VAD uses volume + silence for snappy turn ends.</span>
+                    </span>
+                  </span>
+                  <div className="space-y-2">
+                    <label className="flex items-center gap-2 text-gray-700">
+                      <input
+                        type="radio"
+                        name="vad-mode"
+                        checked={vadMode === "semantic_vad"}
+                        onChange={() => setVadMode("semantic_vad")}
+                        disabled={status !== "idle"}
+                      />
+                      Semantic VAD
+                    </label>
+                    <label className="flex items-center gap-2 text-gray-700">
+                      <input
+                        type="radio"
+                        name="vad-mode"
+                        checked={vadMode === "server_vad"}
+                        onChange={() => setVadMode("server_vad")}
+                        disabled={status !== "idle"}
+                      />
+                      Server VAD
+                    </label>
+                  </div>
+                </div>
 
-            {vadMode === "semantic_vad" ? (
-              <div className="grid grid-cols-1 gap-3">
-                <label className="flex flex-col text-gray-700">
-                  <span className="flex items-center justify-between">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 text-gray-700">
+                    <span>Auto-interrupt</span>
+                    <span className="tooltip">
+                      <span className="w-4 h-4 inline-flex items-center justify-center rounded-full bg-gray-200 text-gray-700 text-[10px]">i</span>
+                      <span className="tooltip-panel">When enabled, the assistant audio is cut as soon as your speech starts, reducing talk-over during barge-in.</span>
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={interruptResponse}
+                    onClick={() => status === 'idle' && setInterruptResponse(!interruptResponse)}
+                    disabled={status !== 'idle'}
+                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${interruptResponse ? 'bg-green-500' : 'bg-gray-300'} ${status !== 'idle' ? 'opacity-60 cursor-not-allowed' : ''}`}
+                    aria-label="Toggle auto-interrupt"
+                  >
+                    <span
+                      className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${interruptResponse ? 'translate-x-5' : 'translate-x-1'}`}
+                    />
+                  </button>
+                </div>
+
+                {vadMode === "semantic_vad" ? (
+                  <div className="grid grid-cols-1 gap-3">
+                    <label className="flex flex-col text-gray-700">
+                      <span className="flex items-center justify-between">
                     <span className="flex items-center gap-2">Eagerness
                       <span className="tooltip">
                         <span className="w-4 h-4 inline-flex items-center justify-center rounded-full bg-gray-200 text-gray-700 text-[10px]">i</span>
@@ -1108,25 +1178,27 @@ export default function VoiceAgent() {
                 </label>
               </div>
             )}
-            <div className="pt-2">
-              <button
-                onClick={() => {
-                  if (vadMode === 'semantic_vad') {
-                    setEagerness(0.6);
-                    setInterruptResponse(true);
-                  } else {
-                    setSilenceDurationMs(400);
-                    setPrefixPaddingMs(300);
-                    setThreshold(0.5);
-                    setInterruptResponse(true);
-                  }
-                }}
-                disabled={status !== 'idle'}
-                className={`px-3 py-1.5 rounded-md text-sm border ${status==='idle' ? 'bg-white hover:bg-gray-50 text-gray-700' : 'bg-gray-200 text-gray-500 cursor-not-allowed'}`}
-              >
-                Reset to defaults
-              </button>
-            </div>
+                <div className="pt-2">
+                  <button
+                    onClick={() => {
+                      if (vadMode === 'semantic_vad') {
+                        setEagerness(0.6);
+                        setInterruptResponse(true);
+                      } else {
+                        setSilenceDurationMs(400);
+                        setPrefixPaddingMs(300);
+                        setThreshold(0.5);
+                        setInterruptResponse(true);
+                      }
+                    }}
+                    disabled={status !== 'idle'}
+                    className={`px-3 py-1.5 rounded-md text-sm border ${status==='idle' ? 'bg-white hover:bg-gray-50 text-gray-700' : 'bg-gray-200 text-gray-500 cursor-not-allowed'}`}
+                  >
+                    Reset to defaults
+                  </button>
+                </div>
+              </div>
+            </section>
           </div>
         </aside>
 
