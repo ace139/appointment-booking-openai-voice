@@ -9,7 +9,9 @@ A production‑ready implementation of OpenAI’s Realtime API (GA) for voice co
 - **WebRTC**: Auto mic+speaker, lowest latency
 - **WebSocket**: Manual mic streaming + audio playback included
 - **Server Relay**: Browser → Next.js → OpenAI Calls for robust SDP
-- **Rich Debugging**: Verbose logs to diagnose end‑to‑end flow
+- **Inline UX**: Tool/MCP/approval/handoff chips directly in chat
+- **Latency Metrics**: Color‑coded first‑audio latency next to timestamps
+- **Rich Debugging**: Optional Trace drawer + verbose logs to diagnose flow
 
 **Key Learnings Encapsulated**
 
@@ -184,7 +186,7 @@ Usage Notes
 
 ## UI & Observability
 
-This demo includes a modern, responsive UI with thoughtful state indicators and developer‑friendly observability. Highlights below.
+This demo ships a modern, responsive UI with an “everything in the conversation” approach. End users see a single, coherent timeline; developers can open a Trace drawer when needed.
 
 Layout & Theming
 - Header: Sticky header with brand and a light/dark theme toggle (`data-theme`).
@@ -197,24 +199,26 @@ Controls (Side Panel)
 - Sliders + tooltips: Sliders for each applicable knob with inline helper tooltips; disabled mid‑session.
 - Reset: “Reset to defaults” sets recommended values for the selected mode.
 
-Status & Activity
-- Indicator pills: Compact chips for core states — Idle, Authorizing, Connecting, Connected. Live pills for Listening, Thinking, Speaking, and “First Audio X ms”.
-- Toasts: Lightweight toasts for connection changes and errors.
-- Activity panel: Scrollable log of system events including:
-  - Tool calls: started/finished, approvals requested
-  - MCP: available tools list and completed MCP calls
-  - Barge‑in: output audio cleared with inferred cause (user speech vs manual clear)
-  - Metrics: first‑audio latency and token usage per turn (input/output, including cached input tokens when present)
+Status & Feedback
+- Indicator pills: Compact chips for core states — Idle, Authorizing, Connecting, Connected — plus live Listening, Thinking, Speaking, and “First Audio X ms”.
+- Voice orb: Shimmer when idle‑connected; pulse while Listening/Speaking; dashed ring while Connecting.
+- Toasts: Lightweight notices for connection changes and errors.
 
 Transcript (Center Panel)
-- Chat bubbles: User (right, blue) and Assistant (left, gray) with avatars and timestamps.
+- Chat bubbles: User (right, blue) and Assistant (left, gray) with avatars and timestamps. Improved top/bottom breathing room and auto‑scroll.
 - Streaming indicator: Animated typing dots while assistant is in_progress.
-- Per‑message meta: For assistant messages, shows first‑audio latency (ms), token usage “tokens in/out (cached C)”, and whether a response was interrupted.
+- Inline chips (assistant):
+  - Tool usage: “Using {tool}” while running, then “Used {tool}” on completion
+  - Approvals: “Approval needed: {name}” (status chip; wire to your approval flow if desired)
+  - MCP: compact chip noting MCP activity (e.g., tools changed or a call completed)
+  - Handoff: “Handoff: {from} → {to}”
+  - Interrupts: “Interrupted · cause”
+- Metrics row: Timestamp plus color‑coded latency chip and token usage when available.
+  - Latency colors: green ≤300ms, yellow ≤1000ms, red >1000ms.
 
 Audio UX & Interruption
-- Voice orb: Animated orb pulses during Listening and Speaking.
 - Output smoothing: Resets the Web Audio playhead on `audio_stopped` to avoid gaps.
-- Barge‑in: On `audio_interrupted` (or `speech_started`), shows a brief Listening pill; in WebSocket mode also stops queued audio immediately to prevent overlap.
+- Barge‑in: On `audio_interrupted` (or `speech_started`), the UI notes an interrupt; in WS mode we also stop queued audio to prevent overlap.
 
 Keyboard & Accessibility
 - Shortcut: Spacebar toggles Start/Stop when focus is not in an input.
@@ -226,7 +230,11 @@ Instructions
 
 Notes
 - The UI applies VAD/interrupt settings at connect time and keeps them fixed for the session (per Realtime constraints).
-- Token metrics and per‑message latency are attached to the most recent assistant turn in this demo; for exact mapping, wire response IDs to items if needed.
+- Metrics binding is resilient to event ordering: latency and token usage queue until the assistant message exists, then attach.
+
+Developer Trace Drawer
+- The historical Activity side panel has been replaced with a compact, optional Trace drawer.
+- Toggle via the “Show Trace” button near Instructions. It mirrors key events for demos/debugging and is hidden by default for a cleaner end‑user experience.
 
 
 ## Example Flows
