@@ -19,9 +19,22 @@ export default function VoiceAgent() {
   const playheadRef = useRef<number>(0);
   const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const listeningTimeoutRef = useRef<number | null>(null);
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const messageTimesRef = useRef<Record<string, number>>({});
   const messageMetaRef = useRef<Record<string, any>>({});
   const lastSpeechStartAtRef = useRef<number | null>(null);
+  // Track last assistant message id and pending metrics to avoid stale closures
+  const lastAssistantIdRef = useRef<string | null>(null);
+  const pendingLatencyRef = useRef<number | null>(null);
+  const pendingUsageRef = useRef<null | { inTok: number; outTok: number; inDet?: any; outDet?: any }>(null);
+  // Queue for arbitrary meta updates when assistant message id is not yet known
+  const pendingMetaUpdatesRef = useRef<Array<(id: string) => void>>([]);
+
+  function withAssistantMetaUpdate(fn: (id: string) => void) {
+    const id = lastAssistantIdRef.current;
+    if (id) fn(id);
+    else pendingMetaUpdatesRef.current.push(fn);
+  }
 
   // Turn detection + interruption knobs (pre-session)
   const [vadMode, setVadMode] = useState<"semantic_vad" | "server_vad">("semantic_vad");
@@ -38,6 +51,7 @@ export default function VoiceAgent() {
   const activityIdRef = useRef(1);
   const activityLoggedUserIdsRef = useRef<Set<string>>(new Set());
   const activityLoggedAssistantIdsRef = useRef<Set<string>>(new Set());
+  const [traceOpen, setTraceOpen] = useState<boolean>(false);
 
   function addToast(text: string, kind: 'info'|'error'|'success' = 'info', ttl = 2500) {
     const id = toastIdRef.current++;
@@ -105,6 +119,16 @@ export default function VoiceAgent() {
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [status]);
+
+  // Auto-scroll chat to bottom for new messages when user is near the bottom
+  useEffect(() => {
+    const el = chatScrollRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if (nearBottom) {
+      try { el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }); } catch { el.scrollTop = el.scrollHeight; }
+    }
+  }, [messages.length]);
 
   async function startWebSocketMicStreaming(session: RealtimeSession) {
     console.log("[VoiceAgent] WS mic streaming: requesting microphone...");
@@ -286,6 +310,11 @@ export default function VoiceAgent() {
         setError(JSON.stringify(e));
         addToast("Session error", "error", 4000);
         addActivity("Session error", 'error');
+        withAssistantMetaUpdate((id) => {
+          const meta = (messageMetaRef.current[id] ||= {});
+          const steps = (meta.steps ||= []);
+          steps.push({ type: 'error', name: 'session', status: 'failed', at: Date.now(), text: (e?.message || 'Unknown error') });
+        });
       });
 
       session.on("history_updated", (history: any[]) => {
@@ -332,12 +361,23 @@ export default function VoiceAgent() {
           // Time tracking for items
           const times = messageTimesRef.current;
           for (const m of out) if (!times[m.id]) times[m.id] = Date.now();
-          // Attach per-message latency if available
-          if (lastLatencyMsRef.current !== null) {
-            const latestAssistant = [...out].reverse().find((m) => m.role === 'assistant');
-            if (latestAssistant) {
-              const meta = (messageMetaRef.current[latestAssistant.id] ||= {});
-              if (typeof meta.latencyMs === 'undefined') meta.latencyMs = lastLatencyMsRef.current;
+          // Track latest assistant id and apply any pending metrics/updates
+          const latestAssistant = [...out].reverse().find((m) => m.role === 'assistant');
+          lastAssistantIdRef.current = latestAssistant?.id || null;
+          if (latestAssistant) {
+            const meta = (messageMetaRef.current[latestAssistant.id] ||= {});
+            if (pendingLatencyRef.current !== null && typeof meta.latencyMs === 'undefined') {
+              meta.latencyMs = pendingLatencyRef.current;
+              pendingLatencyRef.current = null;
+            }
+            if (pendingUsageRef.current) {
+              const { inTok, outTok, inDet, outDet } = pendingUsageRef.current;
+              meta.tokensIn = inTok; meta.tokensOut = outTok; meta.tokenDetails = { in: inDet, out: outDet };
+              pendingUsageRef.current = null;
+            }
+            if (pendingMetaUpdatesRef.current.length > 0) {
+              const queue = pendingMetaUpdatesRef.current.splice(0, pendingMetaUpdatesRef.current.length);
+              queue.forEach((fn) => { try { fn(latestAssistant.id); } catch (e) { console.warn('[VoiceAgent] pending meta update failed', e); } });
             }
           }
 
@@ -367,6 +407,11 @@ export default function VoiceAgent() {
                   }
                 }
                 addActivity(ms ? `Assistant responded in ${(ms/1000).toFixed(2)}s` : 'Assistant responded', 'metric', ms);
+                // Also attach derived latency to the message meta so the UI can show it,
+                // but don't override if a more accurate audio_start latency already exists.
+                if (typeof (messageMetaRef.current[item.id] ||= {}).latencyMs === 'undefined' && typeof ms === 'number') {
+                  messageMetaRef.current[item.id].latencyMs = ms;
+                }
               }
             }
           }
@@ -386,6 +431,14 @@ export default function VoiceAgent() {
           setLastLatencyMs(ms);
           lastLatencyMsRef.current = ms;
           addActivity(`First audio latency`, 'metric', ms);
+          // Bind to known assistant id or queue until history provides it
+          const aId = lastAssistantIdRef.current;
+          if (aId) {
+            const meta = (messageMetaRef.current[aId] ||= {});
+            if (typeof meta.latencyMs === 'undefined') meta.latencyMs = ms;
+          } else {
+            pendingLatencyRef.current = ms;
+          }
           lastTurnStartRef.current = null;
         }
       });
@@ -408,6 +461,11 @@ export default function VoiceAgent() {
           stopAllQueuedAudioPlayback();
         }
         addToast("Interrupted", "info", 1200);
+        withAssistantMetaUpdate((id) => {
+          const meta = (messageMetaRef.current[id] ||= {});
+          meta.interrupted = true;
+          meta.interruptedCause = 'barge-in';
+        });
       });
 
       // Turn lifecycle → show a 'Thinking' pill while the model is preparing a response
@@ -429,13 +487,14 @@ export default function VoiceAgent() {
             const cachedIn = inDet.cached_tokens ?? inDet.cached ?? inDet.input_cached_tokens;
             const cachedLabel = cachedIn ? ` (cached ${cachedIn})` : '';
             addActivity(`Usage: in ${inTok}${cachedLabel}, out ${outTok}`, 'metric');
-            // Attach to the latest assistant message
-            const latestAssistant = [...messages].reverse().find((m) => m.role === 'assistant');
-            if (latestAssistant) {
-              const meta = (messageMetaRef.current[latestAssistant.id] ||= {});
-              meta.tokensIn = inTok;
-              meta.tokensOut = outTok;
-              meta.tokenDetails = { in: inDet, out: outDet };
+            // Attach to the latest assistant message if we know it; otherwise queue
+            const aId = lastAssistantIdRef.current;
+            if (aId) {
+              const meta = (messageMetaRef.current[aId] ||= {});
+              if (typeof meta.latencyMs === 'undefined' && lastLatencyMsRef.current !== null) meta.latencyMs = lastLatencyMsRef.current;
+              meta.tokensIn = inTok; meta.tokensOut = outTok; meta.tokenDetails = { in: inDet, out: outDet };
+            } else {
+              pendingUsageRef.current = { inTok, outTok, inDet, outDet };
             }
           }
         } catch {}
@@ -445,6 +504,10 @@ export default function VoiceAgent() {
       (session as any).on?.("output_audio_buffer.cleared", () => {
         const cause = lastSpeechStartAtRef.current && Date.now() - lastSpeechStartAtRef.current < 2000 ? 'user speech' : 'manual clear';
         addActivity(`Output audio cleared (${cause})`, 'interrupt');
+        withAssistantMetaUpdate((id) => {
+          const meta = (messageMetaRef.current[id] ||= {});
+          meta.outputCleared = cause;
+        });
       });
 
       // Also reflect listening on server VAD speech start/stop
@@ -463,26 +526,56 @@ export default function VoiceAgent() {
       });
       (session as any).on?.("agent_start", (_ctx: any, a: any) => console.log("[VoiceAgent] agent_start", a?.name));
       (session as any).on?.("agent_end", (_ctx: any, a: any, output: any) => console.log("[VoiceAgent] agent_end", a?.name, output));
-      (session as any).on?.("agent_handoff", (_ctx: any, from: any, to: any) => console.log("[VoiceAgent] agent_handoff", from?.name, "->", to?.name));
+      (session as any).on?.("agent_handoff", (_ctx: any, from: any, to: any) => {
+        console.log("[VoiceAgent] agent_handoff", from?.name, "->", to?.name);
+        withAssistantMetaUpdate((id) => {
+          const meta = (messageMetaRef.current[id] ||= {});
+          meta.handoff = { from: from?.name, to: to?.name, at: Date.now() };
+        });
+      });
       (session as any).on?.("agent_tool_start", (_ctx: any, _a: any, tool: any, details: any) => {
         console.log("[VoiceAgent] agent_tool_start", tool?.name, details);
-        addActivity(`Tool call started: ${tool?.name || 'unknown'}`, 'tool');
+        withAssistantMetaUpdate((id) => {
+          const meta = (messageMetaRef.current[id] ||= {});
+          const steps = (meta.steps ||= []);
+          steps.push({ type: 'tool', name: tool?.name || 'tool', status: 'running', at: Date.now(), details });
+        });
       });
       (session as any).on?.("agent_tool_end", (_ctx: any, _a: any, tool: any, result: any) => {
         console.log("[VoiceAgent] agent_tool_end", tool?.name, result);
-        addActivity(`Tool call finished: ${tool?.name || 'unknown'}`, 'tool');
+        withAssistantMetaUpdate((id) => {
+          const meta = (messageMetaRef.current[id] ||= {});
+          const steps = (meta.steps ||= []);
+          const idx = steps.slice().reverse().findIndex((s: any) => s.type==='tool' && s.name === (tool?.name || 'tool'));
+          const i = idx >= 0 ? steps.length - 1 - idx : -1;
+          if (i >= 0) steps[i] = { ...steps[i], status: 'done', doneAt: Date.now(), result };
+          else steps.push({ type: 'tool', name: tool?.name || 'tool', status: 'done', at: Date.now(), doneAt: Date.now(), result });
+        });
       });
       (session as any).on?.("tool_approval_requested", (_ctx: any, _a: any, approval: any) => {
         console.log("[VoiceAgent] tool_approval_requested", approval);
-        addActivity(`Tool approval requested: ${approval?.name || 'unknown'}`, 'tool');
+        withAssistantMetaUpdate((id) => {
+          const meta = (messageMetaRef.current[id] ||= {});
+          const steps = (meta.steps ||= []);
+          steps.push({ type: 'approval', name: approval?.name || 'approval', status: 'requested', at: Date.now(), approval });
+        });
       });
       (session as any).on?.("mcp_tools_changed", (tools: any) => {
         console.log("[VoiceAgent] mcp_tools_changed", tools?.map((t: any) => t?.name));
-        addActivity(`MCP tools available: ${(tools||[]).map((t:any)=>t?.name).filter(Boolean).join(', ')}`, 'mcp');
+        withAssistantMetaUpdate((id) => {
+          const meta = (messageMetaRef.current[id] ||= {});
+          const steps = (meta.steps ||= []);
+          const names = (tools||[]).map((t:any)=>t?.name).filter(Boolean).join(', ');
+          steps.push({ type: 'mcp', name: 'tools_changed', status: 'info', at: Date.now(), text: names });
+        });
       });
       (session as any).on?.("mcp_tool_call_completed", (_ctx: any, _a: any, call: any) => {
         console.log("[VoiceAgent] mcp_tool_call_completed", call?.name);
-        addActivity(`MCP call completed: ${call?.name || 'unknown'}`, 'mcp');
+        withAssistantMetaUpdate((id) => {
+          const meta = (messageMetaRef.current[id] ||= {});
+          const steps = (meta.steps ||= []);
+          steps.push({ type: 'mcp', name: call?.name || 'mcp', status: 'done', at: Date.now() });
+        });
       });
 
       // Transport-level logging
@@ -605,7 +698,23 @@ export default function VoiceAgent() {
 
           {/* Voice activity orb */}
           <div className="mb-6 flex justify-center">
-            <div className={`orb ${listening ? 'orb--listening' : ''} ${speaking ? 'orb--speaking' : ''}`} aria-hidden />
+            <div className="relative">
+              <div
+                className={`orb ${listening ? 'orb--listening' : ''} ${speaking ? 'orb--speaking' : ''} ${status==='connected' && !listening && !speaking ? 'orb--idleConnected' : ''}`}
+                aria-hidden
+              >
+                <div className="absolute inset-0 flex items-center justify-center text-white/95">
+                  <div className="orb-bars">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                  </div>
+                </div>
+              </div>
+              {(status === 'connecting' || status === 'minting-secret') && (
+                <div className="orb-spinner" aria-hidden />
+              )}
+            </div>
           </div>
 
           <div className="mb-4" aria-live="polite">
@@ -659,36 +768,87 @@ export default function VoiceAgent() {
                 <p className="text-red-600 text-sm">{error}</p>
               </div>
             )}
-            {/* Transcript bubbles */}
-            <div className="space-y-3 max-h-[420px] overflow-auto pr-1">
-              {messages.map((m) => (
-                <div key={m.id} className={`flex items-start gap-2 ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+            {/* Transcript area */}
+            <div className="relative border-t border-gray-100 mt-4">
+              <div ref={chatScrollRef} className="space-y-4 h-[min(52vh,520px)] overflow-auto pr-1 pt-6 pb-12">
+                {messages.map((m) => (
+                  <div key={m.id} className={`flex items-start gap-2 ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                   {m.role !== 'user' && (
                     <div className="w-8 h-8 rounded-full flex items-center justify-center text-white" style={{background:"linear-gradient(135deg, rgb(var(--primary)), rgb(var(--accent)))"}}>
                       <span className="text-xs">AI</span>
                     </div>
                   )}
-                  <div className={`max-w-[75%] rounded-2xl px-4 py-2 shadow ${m.role === 'user' ? 'bg-blue-600 text-white rounded-br-sm' : 'bg-gray-100 text-gray-800 rounded-bl-sm'}`}>
-                    <div className="text-sm whitespace-pre-wrap">{m.text || (m.role==='assistant' && m.status==='in_progress' ? (<span className="typing-dots"><span></span><span></span><span></span></span>) : '')}</div>
-                    <div className={`mt-1 text-[10px] ${m.role==='user' ? 'text-white/70' : 'text-gray-500'} flex items-center gap-2 flex-wrap`}>
-                      <span>{new Date(messageTimesRef.current[m.id] || Date.now()).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span>
-                      {m.role==='assistant' && (() => { const meta = messageMetaRef.current[m.id] || {}; return meta.latencyMs ? (<span>• {meta.latencyMs} ms</span>) : null; })()}
-                      {m.role==='assistant' && (() => { const meta = messageMetaRef.current[m.id] || {}; if (!meta.tokensIn && !meta.tokensOut) return null; const cached = meta.tokenDetails?.in?.cached_tokens ?? meta.tokenDetails?.in?.cached ?? meta.tokenDetails?.in?.input_cached_tokens; const cachedLabel = cached ? ` (cached ${cached})` : ''; return (<span>• tokens {meta.tokensIn ?? 0}/{meta.tokensOut ?? 0}{cachedLabel}</span>); })()}
-                      {m.role==='assistant' && (() => { const meta = messageMetaRef.current[m.id] || {}; return meta.interrupted ? (<span>• interrupted ({meta.interruptedCause})</span>) : null; })()}
-                      {m.role==='assistant' && m.status==='in_progress' ? <span>• typing…</span> : null}
+                  <div className="relative max-w-[75%]">
+                    <div className={`rounded-2xl px-4 py-2 shadow ${m.role === 'user' ? 'bg-blue-600 text-white rounded-br-sm' : 'bg-gray-100 text-gray-800 rounded-bl-sm'}`}>
+                      {/* Inline event chips for assistant turns */}
+                      {m.role==='assistant' && (() => { const meta = messageMetaRef.current[m.id] || {}; const steps = meta.steps || []; const hasHandoff = !!meta.handoff; if ((steps && steps.length>0) || hasHandoff || meta.interrupted) {
+                        return (
+                          <div className="mb-1 flex flex-wrap gap-1">
+                            {hasHandoff && (
+                              <span className="px-2 py-0.5 rounded-full text-[10px] bg-blue-100 text-blue-700">Handoff: {meta.handoff.from || '—'} → {meta.handoff.to || '—'}</span>
+                            )}
+                            {steps.map((s: any, idx: number) => {
+                              if (s.type==='tool') {
+                                const base = s.status==='running' ? 'bg-indigo-100 text-indigo-700' : 'bg-green-100 text-green-700';
+                                return <span key={idx} className={`px-2 py-0.5 rounded-full text-[10px] inline-flex items-center gap-1 ${base}`}>{s.status==='running' ? <span className="inline-block w-2 h-2 rounded-full bg-indigo-500 animate-pulse"/> : <span className="inline-block w-2 h-2 rounded-full bg-green-500"/>}{s.status==='running' ? 'Using' : 'Used'} {s.name}</span>;
+                              }
+                              if (s.type==='approval') {
+                                return <span key={idx} className="px-2 py-0.5 rounded-full text-[10px] bg-yellow-100 text-yellow-800">Approval needed: {s.name}</span>;
+                              }
+                              if (s.type==='mcp') {
+                                return <span key={idx} className="px-2 py-0.5 rounded-full text-[10px] bg-fuchsia-100 text-fuchsia-800">MCP {s.name}{s.text?` · ${s.text}`:''}</span>;
+                              }
+                              if (s.type==='error') {
+                                return <span key={idx} className="px-2 py-0.5 rounded-full text-[10px] bg-red-100 text-red-700">Error: {s.text || s.name}</span>;
+                              }
+                              return null;
+                            })}
+                            {meta.interrupted && (
+                              <span className="px-2 py-0.5 rounded-full text-[10px] bg-gray-200 text-gray-700">Interrupted{meta.interruptedCause?` · ${meta.interruptedCause}`:''}</span>
+                            )}
+                          </div>
+                        );
+                      } return null; })()}
+                      <div className="text-sm whitespace-pre-wrap">{m.text || (m.role==='assistant' && m.status==='in_progress' ? (<span className="typing-dots"><span></span><span></span><span></span></span>) : '')}</div>
+                      <div className={`mt-1 text-[10px] ${m.role==='user' ? 'text-white/70' : 'text-gray-500'} flex items-center gap-2 flex-wrap`}>
+                        <span>{new Date(messageTimesRef.current[m.id] || Date.now()).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span>
+                        {m.role==='assistant' && (() => {
+                          const meta = messageMetaRef.current[m.id] || {};
+                          const ms = meta.latencyMs as number | undefined;
+                          if (!ms) return null;
+                          const color = ms <= 300
+                            ? 'bg-green-100 text-green-700'
+                            : ms <= 1000
+                              ? 'bg-yellow-100 text-yellow-800'
+                              : 'bg-red-100 text-red-700';
+                          return (
+                            <span className="inline-flex items-center gap-1">
+                              <span>•</span>
+                              <span className={`rounded px-1.5 py-[1px] text-[10px] ${color}`}>{ms} ms</span>
+                            </span>
+                          );
+                        })()}
+                        {m.role==='assistant' && (() => { const meta = messageMetaRef.current[m.id] || {}; if (!meta.tokensIn && !meta.tokensOut) return null; const cached = meta.tokenDetails?.in?.cached_tokens ?? meta.tokenDetails?.in?.cached ?? meta.tokenDetails?.in?.input_cached_tokens; const cachedLabel = cached ? ` (cached ${cached})` : ''; return (<span>• tokens {meta.tokensIn ?? 0}/{meta.tokensOut ?? 0}{cachedLabel}</span>); })()}
+                        {m.role==='assistant' && (() => { const meta = messageMetaRef.current[m.id] || {}; return meta.interrupted ? (<span>• interrupted ({meta.interruptedCause})</span>) : null; })()}
+                        {m.role==='assistant' && m.status==='in_progress' ? <span>• typing…</span> : null}
+                      </div>
                     </div>
                   </div>
-                  {m.role === 'user' && (
-                    <div className="w-8 h-8 rounded-full flex items-center justify-center bg-gray-200 text-gray-700">
-                      <span className="text-xs">You</span>
-                    </div>
-                  )}
-                </div>
-              ))}
+                    {m.role === 'user' && (
+                      <div className="w-8 h-8 rounded-full flex items-center justify-center bg-gray-200 text-gray-700">
+                        <span className="text-xs">You</span>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+              {/* subtle fades to separate from status/controls */}
+              <div className="pointer-events-none absolute top-0 left-0 right-0 h-6 bg-gradient-to-b from-[rgb(var(--surface))] to-transparent" />
+              <div className="pointer-events-none absolute bottom-0 left-0 right-0 h-10 bg-gradient-to-t from-[rgb(var(--surface))] to-transparent" />
             </div>
           </div>
 
-          <div className="flex flex-wrap gap-4 justify-center">
+          <div className="flex flex-wrap gap-4 justify-center mt-4">
             <button
               onClick={start}
               disabled={status !== "idle"}
@@ -721,6 +881,15 @@ export default function VoiceAgent() {
               aria-controls="instructions-panel"
             >
               <ChevronIcon open={instructionsOpen} /> Instructions
+            </button>
+            <button
+              onClick={() => setTraceOpen((o) => !o)}
+              className="ml-4 inline-flex items-center gap-2 text-gray-600 hover:text-gray-800 text-sm focus-ring"
+              aria-expanded={traceOpen}
+              aria-controls="trace-panel"
+            >
+              <span className={`w-2 h-2 rounded-full ${traceOpen ? 'bg-green-500' : 'bg-gray-400'}`} />
+              {traceOpen ? 'Hide Trace' : 'Show Trace'}
             </button>
             {instructionsOpen && (
               <div id="instructions-panel" className="mt-3 card border border-gray-200 bg-[rgb(var(--surface-2))]">
@@ -915,24 +1084,34 @@ export default function VoiceAgent() {
         </aside>
 
         {/* Activity panel under controls on desktop, below on mobile */}
+        {/* Trace toggle & drawer (developer view) */}
         <div className="md:col-span-1">
-          <div className="bg-white rounded-lg shadow-lg p-4 mt-0 md:mt-0">
-            <h3 className="font-semibold text-gray-800 mb-2">Activity</h3>
-            {activity.length === 0 ? (
-              <p className="text-xs text-gray-500">No recent activity.</p>
-            ) : (
-              <ul className="space-y-1 max-h-48 overflow-auto">
-                {activity.map((a) => (
-                  <li key={a.id} className="text-xs text-gray-700 flex items-center justify-between gap-2">
-                    <span className="truncate">{a.text}</span>
-                    <span className="text-[10px] text-gray-500 whitespace-nowrap">{typeof a.durationMs === 'number' ? `${(a.durationMs/1000).toFixed(2)}s` : new Date(a.time).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
+          <TracePanel activity={activity} open={traceOpen} onClose={() => setTraceOpen(false)} />
         </div>
       </div>
+    </div>
+  );
+}
+
+function TracePanel({ activity, open = false, onClose }: { activity: Array<{ id: number; time: number; kind: string; text: string; durationMs?: number }>; open?: boolean; onClose?: () => void }) {
+  return (
+    <div className="bg-white rounded-lg shadow-lg p-4 mt-0 md:mt-0" id="trace-panel" hidden={!open}>
+      <div className="flex items-center justify-between">
+        <h3 className="font-semibold text-gray-800">Trace</h3>
+        <button onClick={onClose} className="text-sm text-gray-600 hover:text-gray-800">Close</button>
+      </div>
+      {activity.length === 0 ? (
+        <p className="text-xs text-gray-500 mt-2">No recent events.</p>
+      ) : (
+        <ul className="space-y-1 max-h-48 overflow-auto mt-2">
+          {activity.map((a) => (
+            <li key={a.id} className="text-xs text-gray-700 flex items-center justify-between gap-2">
+              <span className="truncate">{a.text}</span>
+              <span className="text-[10px] text-gray-500 whitespace-nowrap">{typeof a.durationMs === 'number' ? `${(a.durationMs/1000).toFixed(2)}s` : new Date(a.time).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
